@@ -1,5 +1,5 @@
 loadstring(game:HttpGet("https://api.jnkie.com/api/v1/luascripts/public/86b678525ebc850ba62a55acd2e92ceddc86cb15dee91b28a2d916854f1b4865/download"))()
-_G.HttpSpy = loadstring(game:HttpGet("https://raw.githubusercontent.com/Zero-Ideas/httpspy/refs/heads/main/merged.lua"))()
+_G.HttpSpy = loadstring(game:HttpGet("https://raw.githubusercontent.com/Zero-Ideas/httpspy/refs/heads/main/spy_spoof.lua"))()
 
 _G.HttpSpy:SetSpoof("httpbin%.org/get", function(requestData)
     return {

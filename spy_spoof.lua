@@ -34,12 +34,16 @@
 local options = ({...})[1] or { AutoDecode = true, Highlighting = true, SaveLogs = true, CLICommands = true, ShowResponse = true, BlockedURLs = {}, Spoofs = {}, API = true };
 local version = "v1.1.3";
 local STORE_KEY = "__HttpSpyEngine";
+-- Cross-execution state must live in the executor's persistent global env.
+-- `shared` (and `_G`) are reset/sandboxed per run in many executors, so a guard
+-- keyed to `shared` reads nil every run and the hooks stack. getgenv() persists.
+local ENV = (type(getgenv) == "function" and getgenv()) or shared or _G;
 
 -- Re-run guard: hooks install only on the first run this session. On a re-run we
 -- merge any newly-passed rules into the live tables and hand back the same API,
 -- so re-running to add spoofs never stacks duplicate hooks or wipes the log.
-if shared[STORE_KEY] and shared[STORE_KEY].installed then
-    local store = shared[STORE_KEY];
+if ENV[STORE_KEY] and ENV[STORE_KEY].installed then
+    local store = ENV[STORE_KEY];
     if type(options.Spoofs) == "table" then
         for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
     end;
@@ -73,9 +77,9 @@ local Pcall = clonef(pcall);
 local Pairs = clonef(pairs);
 local Error = clonef(error);
 local getnamecallmethod = clonef(getnamecallmethod);
--- Persistent state kept in `shared` so re-runs reuse the same tables.
-shared[STORE_KEY] = shared[STORE_KEY] or {};
-local store = shared[STORE_KEY];
+-- Persistent state kept in the executor global env so re-runs reuse the tables.
+ENV[STORE_KEY] = ENV[STORE_KEY] or {};
+local store = ENV[STORE_KEY];
 store.spoofs  = store.spoofs  or (options.Spoofs or {});
 store.blocked = store.blocked or (options.BlockedURLs or {});
 store.hooked  = store.hooked  or {};
