@@ -39,10 +39,16 @@ local PING_URL  = "__HTTPSPY_INTERNAL_PING__"; -- sentinel URL our hook answers 
 local reqfunc = (syn or http) and (syn or http).request or request;
 assert(reqfunc, "No support for an HTTP request function!");
 
--- Cross-execution state: try every table that MIGHT persist. Some executors
--- sandbox getgenv()/shared/_G per run, so we don't trust any single one.
+-- Persistent store. getgenv()._G is the executor's global variable table and
+-- survives across separate executions, so that's the primary home for our state.
+-- A couple of other tables are mirrored into as a fallback for stricter executors.
+local genv = (type(getgenv) == "function") and getgenv() or nil;
 local candidateEnvs = {};
-if type(getgenv) == "function" then candidateEnvs[#candidateEnvs + 1] = getgenv(); end;
+if genv then
+    genv._G = genv._G or {};                      -- persists across executions
+    candidateEnvs[#candidateEnvs + 1] = genv._G;  -- primary
+    candidateEnvs[#candidateEnvs + 1] = genv;
+end;
 candidateEnvs[#candidateEnvs + 1] = _G;
 candidateEnvs[#candidateEnvs + 1] = shared;
 
@@ -55,10 +61,26 @@ local function findStore()
     return nil;
 end;
 
--- Persistence-proof guard: ask the (possibly already-hooked) request function
--- whether one of OUR hooks is live by sending it the sentinel URL. This does not
--- rely on any global table surviving between executions -- only on the fact that
--- function hooks themselves persist (which is exactly why they were stacking).
+local function mergeRules(store)
+    if type(options.Spoofs) == "table" then
+        for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
+    end;
+    if type(options.BlockedURLs) == "table" then
+        for k, v in pairs(options.BlockedURLs) do store.blocked[k] = v; end;
+    end;
+end;
+
+-- 1) Fast path: a previous run left a fully-installed engine in a persistent table.
+local existing = findStore();
+if existing and existing.installed then
+    mergeRules(existing);
+    print("[HttpSpy] Already active -- reusing existing hooks and API (nothing re-installed).");
+    return existing.API;
+end;
+
+-- 2) Safety net for stricter executors: even if no table persisted, detect our
+--    live hook by pinging it, so we never stack a second hook. Relies only on the
+--    fact that function hooks themselves persist (which is why they were stacking).
 local function alreadyHooked()
     if type(reqfunc) ~= "function" then return false; end;
     local ok, res = pcall(reqfunc, { Url = PING_URL });
@@ -66,20 +88,12 @@ local function alreadyHooked()
 end;
 
 if alreadyHooked() then
-    local store = findStore();
-    if store then
-        if type(options.Spoofs) == "table" then
-            for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
-        end;
-        if type(options.BlockedURLs) == "table" then
-            for k, v in pairs(options.BlockedURLs) do store.blocked[k] = v; end;
-        end;
+    if existing then
+        mergeRules(existing);
         print("[HttpSpy] Already active -- reusing existing hooks and API (nothing re-installed).");
-        return store.API;
+        return existing.API;
     end;
-    -- Our hook is live but no global table persisted in this executor, so we can't
-    -- hand back the original API object. We still refuse to install a second hook.
-    warn("[HttpSpy] Already hooked; the shared store didn't persist in this executor, so not re-hooking. Use the API returned by your FIRST run, or rejoin to reset.");
+    warn("[HttpSpy] Hook already live but the store didn't persist here; not re-hooking. Keep your first run's API, or rejoin to reset.");
     return nil;
 end;
 
@@ -106,9 +120,9 @@ local Pcall = clonef(pcall);
 local Pairs = clonef(pairs);
 local Error = clonef(error);
 local getnamecallmethod = clonef(getnamecallmethod);
--- Create the shared store and write it to every candidate env, so whichever one
--- happens to persist in this executor will hold it for a future re-run.
-local store = findStore() or {};
+-- Reuse the store from the persistent env (or make one) and mirror it into every
+-- candidate env so whichever persists here holds it for the next re-run.
+local store = existing or {};
 for _, e in next, candidateEnvs do
     if type(e) == "table" then e[STORE_KEY] = store; end;
 end;
@@ -317,6 +331,9 @@ end;
 if not debug.info(2, "f") then
     pconsole("You are running an outdated version, please use the loadstring at https://github.com/NotDSF/HttpSpy\n");
 end;
+
+-- Hooks are live now; mark installed so future runs take the fast reuse path.
+store.installed = true;
 
 if not options.API then return end;
 
