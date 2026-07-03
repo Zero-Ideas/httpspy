@@ -114,6 +114,11 @@ __request = hookfunction(reqfunc, newcclosure(function(req)
 
     local t = crunning();
     cwrap(function()
+        task.wait(); -- ensure the calling thread reaches cyield() before any cresume below;
+                     -- real requests yield internally via __request, but spoofed/blocked
+                     -- responses never touch the network, so without this cresume(t, ...)
+                     -- fires while t is still running and crashes the client
+
         if RequestData.Url and blocked[RequestData.Url] then
             printf("%s.request(%s) -- blocked url\n\n", libtype, Serializer.Serialize(RequestData));
             return cresume(t, {});
