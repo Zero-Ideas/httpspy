@@ -34,24 +34,53 @@
 local options = ({...})[1] or { AutoDecode = true, Highlighting = true, SaveLogs = true, CLICommands = true, ShowResponse = true, BlockedURLs = {}, Spoofs = {}, API = true };
 local version = "v1.1.3";
 local STORE_KEY = "__HttpSpyEngine";
--- Cross-execution state must live in the executor's persistent global env.
--- `shared` (and `_G`) are reset/sandboxed per run in many executors, so a guard
--- keyed to `shared` reads nil every run and the hooks stack. getgenv() persists.
-local ENV = (type(getgenv) == "function" and getgenv()) or shared or _G;
+local PING_URL  = "__HTTPSPY_INTERNAL_PING__"; -- sentinel URL our hook answers to prove it's live
 
--- Re-run guard: hooks install only on the first run this session. On a re-run we
--- merge any newly-passed rules into the live tables and hand back the same API,
--- so re-running to add spoofs never stacks duplicate hooks or wipes the log.
-if ENV[STORE_KEY] and ENV[STORE_KEY].installed then
-    local store = ENV[STORE_KEY];
-    if type(options.Spoofs) == "table" then
-        for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
+local reqfunc = (syn or http) and (syn or http).request or request;
+assert(reqfunc, "No support for an HTTP request function!");
+
+-- Cross-execution state: try every table that MIGHT persist. Some executors
+-- sandbox getgenv()/shared/_G per run, so we don't trust any single one.
+local candidateEnvs = {};
+if type(getgenv) == "function" then candidateEnvs[#candidateEnvs + 1] = getgenv(); end;
+candidateEnvs[#candidateEnvs + 1] = _G;
+candidateEnvs[#candidateEnvs + 1] = shared;
+
+local function findStore()
+    for _, e in next, candidateEnvs do
+        if type(e) == "table" and type(e[STORE_KEY]) == "table" then
+            return e[STORE_KEY];
+        end;
     end;
-    if type(options.BlockedURLs) == "table" then
-        for k, v in pairs(options.BlockedURLs) do store.blocked[k] = v; end;
+    return nil;
+end;
+
+-- Persistence-proof guard: ask the (possibly already-hooked) request function
+-- whether one of OUR hooks is live by sending it the sentinel URL. This does not
+-- rely on any global table surviving between executions -- only on the fact that
+-- function hooks themselves persist (which is exactly why they were stacking).
+local function alreadyHooked()
+    if type(reqfunc) ~= "function" then return false; end;
+    local ok, res = pcall(reqfunc, { Url = PING_URL });
+    return ok and type(res) == "table" and res.__HttpSpyPing == true;
+end;
+
+if alreadyHooked() then
+    local store = findStore();
+    if store then
+        if type(options.Spoofs) == "table" then
+            for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
+        end;
+        if type(options.BlockedURLs) == "table" then
+            for k, v in pairs(options.BlockedURLs) do store.blocked[k] = v; end;
+        end;
+        print("[HttpSpy] Already active -- reusing existing hooks and API (nothing re-installed).");
+        return store.API;
     end;
-    print("[HttpSpy] Already active this session -- returning existing API (hooks not re-installed).");
-    return store.API;
+    -- Our hook is live but no global table persisted in this executor, so we can't
+    -- hand back the original API object. We still refuse to install a second hook.
+    warn("[HttpSpy] Already hooked; the shared store didn't persist in this executor, so not re-hooking. Use the API returned by your FIRST run, or rejoin to reset.");
+    return nil;
 end;
 
 local logname = string.format("%d-%s-log.txt", game.PlaceId, os.date("%d_%m_%y"));
@@ -77,9 +106,12 @@ local Pcall = clonef(pcall);
 local Pairs = clonef(pairs);
 local Error = clonef(error);
 local getnamecallmethod = clonef(getnamecallmethod);
--- Persistent state kept in the executor global env so re-runs reuse the tables.
-ENV[STORE_KEY] = ENV[STORE_KEY] or {};
-local store = ENV[STORE_KEY];
+-- Create the shared store and write it to every candidate env, so whichever one
+-- happens to persist in this executor will hold it for a future re-run.
+local store = findStore() or {};
+for _, e in next, candidateEnvs do
+    if type(e) == "table" then e[STORE_KEY] = store; end;
+end;
 store.spoofs  = store.spoofs  or (options.Spoofs or {});
 store.blocked = store.blocked or (options.BlockedURLs or {});
 store.hooked  = store.hooked  or {};
@@ -90,7 +122,6 @@ local spoofs  = store.spoofs;
 local hooked  = store.hooked;
 local proxied = store.proxied;
 local enabled = true;
-local reqfunc = (syn or http).request;
 local libtype = syn and "syn" or "http";
 local methods = {
     HttpGet = not syn,
@@ -102,7 +133,6 @@ local methods = {
 
 Serializer.UpdateConfig({ highlighting = options.Highlighting });
 
-local RecentCommit = game.HttpService:JSONDecode(game:HttpGet("https://api.github.com/repos/NotDSF/HttpSpy/commits?per_page=1&path=init.lua"))[1].commit.message;
 local OnRequest = Instance.new("BindableEvent");
 
 local function printf(...) 
@@ -184,6 +214,12 @@ __namecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 end));
 
 __request = hookfunction(reqfunc, newcclosure(function(req) 
+    -- Answer the internal ping so future runs can detect this live hook without
+    -- relying on any global table having persisted.
+    if Type(req) == "table" and req.Url == PING_URL then
+        return { __HttpSpyPing = true };
+    end;
+
     if Type(req) ~= "table" then return __request(req); end;
     
     local RequestData = DeepClone(req);
@@ -281,8 +317,6 @@ end;
 if not debug.info(2, "f") then
     pconsole("You are running an outdated version, please use the loadstring at https://github.com/NotDSF/HttpSpy\n");
 end;
-
-store.installed = true;
 
 if not options.API then return end;
 
