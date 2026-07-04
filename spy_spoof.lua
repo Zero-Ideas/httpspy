@@ -280,7 +280,7 @@ if not GENV._G[KEY] then
 
     -- PUBLISH LAST: only now is the engine considered installed.
     GENV._G[KEY]    = State
-    GENV._G.HttpSpy = API
+    GENV._G.["HttpSpy"] = API
     pconsole(format("[HttpSpy+Spoofer %s] Engine installed. Hooks are live.\n", State.Version))
 end
 
