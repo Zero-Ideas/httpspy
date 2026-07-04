@@ -25,10 +25,15 @@ local passedOptions = ({ ... })[1]
 --=============================================================================
 -- 1. ONE-TIME ENGINE INSTALL (publishes to _G only on full success)
 --=============================================================================
-if not GENV._G[KEY] then
+-- Treat "table present but .API missing" as NOT installed. That state can only
+-- come from an old early-publish build that died before placing any hooks, so
+-- rebuilding over it is safe (no hooks to duplicate).
+if not (GENV._G[KEY] and GENV._G[KEY].API) then
+    GENV._G[KEY] = nil   -- drop any stale/poisoned table before rebuilding
+
     -- Build everything against this LOCAL table; publish at the very end.
     local State = {
-        Version   = "2.1.0",
+        Version   = "2.1.1",
         Enabled   = true,
         Options   = { AutoDecode = true, Highlighting = true, SaveLogs = true, ShowResponse = true, API = true },
         Spoofs    = {},
@@ -280,7 +285,7 @@ if not GENV._G[KEY] then
 
     -- PUBLISH LAST: only now is the engine considered installed.
     GENV._G[KEY]    = State
-    GENV._G["HttpSpy"] = API
+    GENV._G.HttpSpy = API
     pconsole(format("[HttpSpy+Spoofer %s] Engine installed. Hooks are live.\n", State.Version))
 end
 
