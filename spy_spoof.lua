@@ -1,392 +1,366 @@
 --[[
-    HttpSpy v1.1.3 (spoof-enabled)
+    HttpSpy + DynamicSpoofEngine (merged)  v2.0.0
+    Based on HttpSpy v1.1.3 by NotDSF + your DynamicSpoofEngine.
 
-    Merge of HttpSpy's request logger with a static/dynamic response spoof
-    engine. Everything HttpSpy already did (logging, proxying, blocking,
-    response hooks, auto JSON decode) still works. On top of that you can now
-    register spoof rules that short-circuit the real request and return a
-    fabricated response.
+    Design goals:
+      * Idempotent  - safe to execute any number of times. All hooks are
+                      installed EXACTLY once. Re-running only refreshes the
+                      live config + spoof rules; it never stacks a second hook.
+      * Persistent  - everything that must survive across executions (originals,
+                      the API, spoof rules, blocked/proxied tables, the log
+                      handle) lives in getgenv()._G[KEY]. Edit the CONFIG /
+                      SPOOF RULES section at the bottom and re-execute to update
+                      behaviour live, no rejoin required.
 
-    A spoof rule can be:
-        * a table    -> returned as-is as the response (defaults filled in)
-        * a function -> function(requestData) that returns a response table
-
-    Rule keys are matched against the request URL with string.find (Lua
-    pattern), matching spoofer.lua's original behaviour.
-
-    New API:
-        API:Spoof(urlPattern, response)   -- table (static) or function(req) -> table (dynamic)
-        API:UnSpoof(urlPattern)
-        API:ClearSpoofs()
-
-    You can also seed rules up front:  options.Spoofs = { ["pattern"] = ... }
-
-    Note: a matched spoof rule takes precedence over BlockedURLs for the same
-    URL, and never touches the network.
-
-    Safe to run more than once per session: the hooks install only on the first
-    run. Re-running merges any newly-passed options.Spoofs / options.BlockedURLs
-    into the live tables and returns the SAME API object, so nothing stacks.
-    Preferred workflow: keep the returned API and call API:Spoof(...) directly
-    to add rules mid-session as you read outputs.
+    Access the API later from anywhere with:
+        getgenv()._G.__HttpSpyEngine.API
+    or the convenience alias:
+        getgenv()._G.HttpSpy
 ]]
 
-local options = ({...})[1] or { AutoDecode = true, Highlighting = true, SaveLogs = true, CLICommands = true, ShowResponse = true, BlockedURLs = {}, Spoofs = {}, API = true };
-local version = "v1.1.3";
-local STORE_KEY = "__HttpSpyEngine";
-local PING_URL  = "__HTTPSPY_INTERNAL_PING__"; -- sentinel URL our hook answers to prove it's live
+--=============================================================================
+-- 0. PERSISTENT STORE
+--=============================================================================
+local GENV = getgenv()
+GENV._G = GENV._G or {}                 -- executor global table
+local KEY = "__HttpSpyEngine"
 
-local reqfunc = (syn or http) and (syn or http).request or request;
-assert(reqfunc, "No support for an HTTP request function!");
+local passedOptions = ({ ... })[1]      -- optional options table on this run
 
--- Persistent store. getgenv()._G is the executor's global variable table and
--- survives across separate executions, so that's the primary home for our state.
--- A couple of other tables are mirrored into as a fallback for stricter executors.
-local genv = (type(getgenv) == "function") and getgenv() or nil;
-local candidateEnvs = {};
-if genv then
-    genv._G = genv._G or {};                      -- persists across executions
-    candidateEnvs[#candidateEnvs + 1] = genv._G;  -- primary
-    candidateEnvs[#candidateEnvs + 1] = genv;
-end;
-candidateEnvs[#candidateEnvs + 1] = _G;
-candidateEnvs[#candidateEnvs + 1] = shared;
+--=============================================================================
+-- 1. ONE-TIME ENGINE INSTALL  (runs only on the FIRST execution)
+--=============================================================================
+if not GENV._G[KEY] then
+    -----------------------------------------------------------------------
+    -- 1a. State container (the single source of truth, lives forever)
+    -----------------------------------------------------------------------
+    local State = {
+        Version   = "2.0.0",
+        Enabled   = true,               -- master switch for logging
+        Options   = {
+            AutoDecode   = true,
+            Highlighting = true,
+            SaveLogs     = true,
+            ShowResponse = true,
+            API          = true,
+        },
+        Spoofs    = {},                 -- [urlPattern] = table | function(req)
+        Blocked   = {},                 -- [url] = true
+        Proxied   = {},                 -- [host] = replacementHost
+        Hooked    = {},                 -- [url] = function(response) -> response
+        Originals = {},                 -- captured original functions
+    }
+    GENV._G[KEY] = State
 
-local function findStore()
-    for _, e in next, candidateEnvs do
-        if type(e) == "table" and type(e[STORE_KEY]) == "table" then
-            return e[STORE_KEY];
-        end;
-    end;
-    return nil;
-end;
+    -----------------------------------------------------------------------
+    -- 1b. Clone everything the hooks touch so our own calls stay un-hooked
+    -----------------------------------------------------------------------
+    local clonef      = clonefunction
+    local pconsole    = clonef(rconsoleprint)
+    local format      = clonef(string.format)
+    local gsub        = clonef(string.gsub)
+    local match       = clonef(string.match)
+    local find        = clonef(string.find)
+    local append      = clonef(appendfile)
+    local Type        = clonef(type)
+    local crunning    = clonef(coroutine.running)
+    local cwrap       = clonef(coroutine.wrap)
+    local cresume     = clonef(coroutine.resume)
+    local cyield      = clonef(coroutine.yield)
+    local Pcall       = clonef(pcall)
+    local Pairs       = clonef(pairs)
+    local Error       = clonef(error)
+    local getnamecallmethod = clonef(getnamecallmethod)
 
-local function mergeRules(store)
-    if type(options.Spoofs) == "table" then
-        for k, v in pairs(options.Spoofs) do store.spoofs[k] = v; end;
-    end;
-    if type(options.BlockedURLs) == "table" then
-        for k, v in pairs(options.BlockedURLs) do store.blocked[k] = v; end;
-    end;
-end;
+    local reqfunc = (syn or http).request
+    local libtype = syn and "syn" or "http"
 
--- 1) Fast path: a previous run left a fully-installed engine in a persistent table.
-local existing = findStore();
-if existing and existing.installed then
-    mergeRules(existing);
-    print("[HttpSpy] Already active -- reusing existing hooks and API (nothing re-installed).");
-    return existing.API;
-end;
+    -----------------------------------------------------------------------
+    -- 1c. Serializer (leopard) + log file, created once
+    -----------------------------------------------------------------------
+    local Serializer = loadstring(game:HttpGet("https://raw.githubusercontent.com/NotDSF/leopard/main/rbx/leopard-syn.lua"))()
+    Serializer.UpdateConfig({ highlighting = State.Options.Highlighting })
+    State.Serializer = Serializer
 
--- 2) Safety net for stricter executors: even if no table persisted, detect our
---    live hook by pinging it, so we never stack a second hook. Relies only on the
---    fact that function hooks themselves persist (which is why they were stacking).
-local function alreadyHooked()
-    if type(reqfunc) ~= "function" then return false; end;
-    local ok, res = pcall(reqfunc, { Url = PING_URL });
-    return ok and type(res) == "table" and res.__HttpSpyPing == true;
-end;
+    local logname = format("%d-%s-log.txt", game.PlaceId, os.date("%d_%m_%y"))
+    State.LogName = logname
+    if State.Options.SaveLogs then
+        writefile(logname, format("Http Logs from %s\n\n", os.date("%d/%m/%y")))
+    end
 
-if alreadyHooked() then
-    if existing then
-        mergeRules(existing);
-        print("[HttpSpy] Already active -- reusing existing hooks and API (nothing re-installed).");
-        return existing.API;
-    end;
-    warn("[HttpSpy] Hook already live but the store didn't persist here; not re-hooking. Keep your first run's API, or rejoin to reset.");
-    return nil;
-end;
+    -- printf reads State live so SaveLogs can be toggled on re-run
+    local function printf(...)
+        if State.Options.SaveLogs then
+            append(logname, gsub(format(...), "%\27%[%d+m", ""))
+        end
+        return pconsole(format(...))
+    end
+    State.Printf = printf
 
-local logname = string.format("%d-%s-log.txt", game.PlaceId, os.date("%d_%m_%y"));
-
-if options.SaveLogs then
-    writefile(logname, string.format("Http Logs from %s\n\n", os.date("%d/%m/%y"))) 
-end;
-
-local Serializer = loadstring(game:HttpGet("https://raw.githubusercontent.com/NotDSF/leopard/main/rbx/leopard-syn.lua"))();
-local clonef = clonefunction;
-local pconsole = clonef(rconsoleprint);
-local format = clonef(string.format);
-local gsub = clonef(string.gsub);
-local match = clonef(string.match);
-local find = clonef(string.find);
-local append = clonef(appendfile);
-local Type = clonef(type);
-local crunning = clonef(coroutine.running);
-local cwrap = clonef(coroutine.wrap);
-local cresume = clonef(coroutine.resume);
-local cyield = clonef(coroutine.yield);
-local Pcall = clonef(pcall);
-local Pairs = clonef(pairs);
-local Error = clonef(error);
-local getnamecallmethod = clonef(getnamecallmethod);
--- Reuse the store from the persistent env (or make one) and mirror it into every
--- candidate env so whichever persists here holds it for the next re-run.
-local store = existing or {};
-for _, e in next, candidateEnvs do
-    if type(e) == "table" then e[STORE_KEY] = store; end;
-end;
-store.spoofs  = store.spoofs  or (options.Spoofs or {});
-store.blocked = store.blocked or (options.BlockedURLs or {});
-store.hooked  = store.hooked  or {};
-store.proxied = store.proxied or {};
-
-local blocked = store.blocked;
-local spoofs  = store.spoofs;
-local hooked  = store.hooked;
-local proxied = store.proxied;
-local enabled = true;
-local libtype = syn and "syn" or "http";
-local methods = {
-    HttpGet = not syn,
-    HttpGetAsync = not syn,
-    GetObjects = true,
-    HttpPost = not syn,
-    HttpPostAsync = not syn
-}
-
-Serializer.UpdateConfig({ highlighting = options.Highlighting });
-
-local OnRequest = Instance.new("BindableEvent");
-
-local function printf(...) 
-    if options.SaveLogs then
-        append(logname, gsub(format(...), "%\27%[%d+m", ""));
-    end;
-    return pconsole(format(...));
-end;
-
-local function ConstantScan(constant)
-    for i,v in Pairs(getgc(true)) do
-        if type(v) == "function" and islclosure(v) and getfenv(v).script == getfenv(saveinstance).script and table.find(debug.getconstants(v), constant) then
-            return v;
-        end;
-    end;
-end;
-
-local function DeepClone(tbl, cloned)
-    cloned = cloned or {};
-
-    for i,v in Pairs(tbl) do
-        if Type(v) == "table" then
-            cloned[i] = DeepClone(v);
-            continue;
-        end;
-        cloned[i] = v;
-    end;
-
-    return cloned;
-end;
-
--- Return the first spoof rule whose key matches the URL (string.find / Lua pattern).
-local function MatchSpoof(url)
-    if Type(url) ~= "string" then return nil; end;
-    for pattern, modifier in Pairs(spoofs) do
-        if find(url, pattern) then
-            return modifier;
-        end;
-    end;
-    return nil;
-end;
-
--- Turn a spoof rule (table = static, function = dynamic) into a full response table.
-local function BuildSpoof(rule, requestData)
-    local FakeResponse;
-    if Type(rule) == "function" then
-        local ok, generated = Pcall(rule, requestData);
-        if not ok then
-            Error(generated, 0);
-        end;
-        FakeResponse = generated;
-    elseif Type(rule) == "table" then
-        FakeResponse = DeepClone(rule);
-    end;
-
-    if Type(FakeResponse) ~= "table" then
-        return nil;
-    end;
-
-    -- Fill in sensible defaults so downstream consumers don't choke on a partial response.
-    FakeResponse.Headers = FakeResponse.Headers or {};
-    if FakeResponse.StatusCode == nil then FakeResponse.StatusCode = 200; end;
-    if FakeResponse.StatusText == nil then FakeResponse.StatusText = "OK"; end;
-    if FakeResponse.Success == nil then FakeResponse.Success = FakeResponse.StatusCode >= 200 and FakeResponse.StatusCode < 300; end;
-    if FakeResponse.Body == nil then FakeResponse.Body = ""; end;
-
-    return FakeResponse;
-end;
-
-local __namecall, __request;
-__namecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-    local method = getnamecallmethod();
-
-    if methods[method] then
-        printf("game:%s(%s)\n\n", method, Serializer.FormatArguments(...));
-    end;
-
-    return __namecall(self, ...);
-end));
-
-__request = hookfunction(reqfunc, newcclosure(function(req) 
-    -- Answer the internal ping so future runs can detect this live hook without
-    -- relying on any global table having persisted.
-    if Type(req) == "table" and req.Url == PING_URL then
-        return { __HttpSpyPing = true };
-    end;
-
-    if Type(req) ~= "table" then return __request(req); end;
-    
-    local RequestData = DeepClone(req);
-    if not enabled then
-        return __request(req);
-    end;
-
-    if Type(RequestData.Url) ~= "string" then return __request(req) end;
-
-    -- Spoofing: if a rule matches, fabricate the response and skip the network entirely.
-    -- Handled synchronously here (rather than inside the async yield/resume block) so a
-    -- static/dynamic spoof never tries to resume a thread that is still running.
-    local spoofRule = MatchSpoof(RequestData.Url);
-    if spoofRule then
-        OnRequest:Fire(RequestData);
-
-        local FakeResponse = BuildSpoof(spoofRule, RequestData);
-        if FakeResponse then
-            if options.ShowResponse then
-                local BackupData = DeepClone(FakeResponse);
-                if BackupData.Headers and BackupData.Headers["Content-Type"] and match(BackupData.Headers["Content-Type"], "application/json") and options.AutoDecode then
-                    local ok, res = Pcall(game.HttpService.JSONDecode, game.HttpService, BackupData.Body);
-                    if ok then
-                        BackupData.Body = res;
-                    end;
-                end;
-                printf("%s.request(%s) -- spoofed\n\nResponse Data: %s\n\n", libtype, Serializer.Serialize(RequestData), Serializer.Serialize(BackupData));
+    -----------------------------------------------------------------------
+    -- 1d. Helpers
+    -----------------------------------------------------------------------
+    local function DeepClone(tbl, cloned)
+        cloned = cloned or {}
+        for i, v in Pairs(tbl) do
+            if Type(v) == "table" then
+                cloned[i] = DeepClone(v)
             else
-                printf("%s.request(%s) -- spoofed\n\n", libtype, Serializer.Serialize(RequestData));
-            end;
+                cloned[i] = v
+            end
+        end
+        return cloned
+    end
 
-            return hooked[RequestData.Url] and hooked[RequestData.Url](FakeResponse) or FakeResponse;
-        end;
-    end;
+    -- Find the first spoof rule whose pattern is contained in the URL
+    local function MatchSpoof(url)
+        for pattern, modifier in Pairs(State.Spoofs) do
+            if find(url, pattern, 1, true) then   -- plain substring match
+                return modifier
+            end
+        end
+        return nil
+    end
 
-    if not options.ShowResponse then
-        printf("%s.request(%s)\n\n", libtype, Serializer.Serialize(RequestData));
-        return __request(req);
-    end;
+    local OnRequest = Instance.new("BindableEvent")
+    State.OnRequestSignal = OnRequest
 
-    local t = crunning();
-    cwrap(function() 
-        if RequestData.Url and blocked[RequestData.Url] then
-            printf("%s.request(%s) -- blocked url\n\n", libtype, Serializer.Serialize(RequestData));
-            return cresume(t, {});
-        end;
+    -- namecall methods to log
+    local methods = {
+        HttpGet      = not syn,
+        HttpGetAsync = not syn,
+        GetObjects   = true,
+        HttpPost     = not syn,
+        HttpPostAsync = not syn,
+    }
 
-        if RequestData.Url then
-            local Host = string.match(RequestData.Url, "https?://(%w+.%w+)/");
-            if Host and proxied[Host] then
-                RequestData.Url = gsub(RequestData.Url, Host, proxied[Host], 1);
-            end; 
-        end;
+    -----------------------------------------------------------------------
+    -- 1e. __namecall hook (install once)
+    -----------------------------------------------------------------------
+    local __namecall
+    __namecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if State.Enabled and methods[method] then
+            printf("game:%s(%s)\n\n", method, Serializer.FormatArguments(...))
+        end
+        return __namecall(self, ...)
+    end))
+    State.Originals.namecall = __namecall
 
-        OnRequest:Fire(RequestData);
+    -----------------------------------------------------------------------
+    -- 1f. request hook (install once) -- combines SPOOF + BLOCK + PROXY + LOG
+    -----------------------------------------------------------------------
+    local __request
+    __request = hookfunction(reqfunc, newcclosure(function(req)
+        local S = GENV._G[KEY]
+        if Type(req) ~= "table" or Type(req.Url) ~= "string" then
+            return __request(req)
+        end
 
-        local ok, ResponseData = Pcall(__request, RequestData); -- I know of a detection with this
-        if not ok then
-            Error(ResponseData, 0);
-        end;
+        local RequestData = DeepClone(req)
 
-        local BackupData = {};
-        for i,v in Pairs(ResponseData) do
-            BackupData[i] = v;
-        end;
+        -----------------------------------------------------------------
+        -- SPOOF  (synchronous return -- no yield, so no coroutine dance)
+        -----------------------------------------------------------------
+        local rule = MatchSpoof(RequestData.Url)
+        if rule then
+            local fake
+            if Type(rule) == "function" then
+                local ok, res = Pcall(rule, RequestData)
+                if ok then fake = res end
+            elseif Type(rule) == "table" then
+                fake = rule
+            end
+            if fake then
+                if S.Options.ShowResponse then
+                    printf("%s.request(%s) -- SPOOFED\n\nResponse Data: %s\n\n",
+                        libtype, Serializer.Serialize(RequestData), Serializer.Serialize(fake))
+                else
+                    printf("%s.request(%s) -- SPOOFED\n\n", libtype, Serializer.Serialize(RequestData))
+                end
+                return fake
+            end
+        end
 
-        if BackupData.Headers["Content-Type"] and match(BackupData.Headers["Content-Type"], "application/json") and options.AutoDecode then
-            local body = BackupData.Body;
-            local ok, res = Pcall(game.HttpService.JSONDecode, game.HttpService, body);
-            if ok then
-                BackupData.Body = res;
-            end;
-        end;
+        -----------------------------------------------------------------
+        -- BLOCK  (synchronous return)
+        -----------------------------------------------------------------
+        if S.Blocked[RequestData.Url] then
+            printf("%s.request(%s) -- blocked url\n\n", libtype, Serializer.Serialize(RequestData))
+            return {}
+        end
 
-        printf("%s.request(%s)\n\nResponse Data: %s\n\n", libtype, Serializer.Serialize(RequestData), Serializer.Serialize(BackupData));
-        cresume(t, hooked[RequestData.Url] and hooked[RequestData.Url](ResponseData) or ResponseData);
-    end)();
-    return cyield();
-end));
+        -----------------------------------------------------------------
+        -- PROXY host rewrite
+        -----------------------------------------------------------------
+        local Host = match(RequestData.Url, "https?://(%w+%.%w+)/")
+        if Host and S.Proxied[Host] then
+            RequestData.Url = gsub(RequestData.Url, Host, S.Proxied[Host], 1)
+        end
 
-if request then
-    replaceclosure(request, reqfunc);
-end;
+        OnRequest:Fire(RequestData)
 
-for method, enabled in Pairs(methods) do
-    if enabled then
-        local b;
-        b = hookfunction(game[method], newcclosure(function(self, ...) 
-            printf("game.%s(game, %s)\n\n", method, Serializer.FormatArguments(...));
-            return b(self, ...);
-        end));
-    end;
-end;
+        -----------------------------------------------------------------
+        -- REAL REQUEST  (needs to yield -> trampoline through a coroutine
+        -- because you cannot yield across a newcclosure boundary)
+        -----------------------------------------------------------------
+        local t = crunning()
+        cwrap(function()
+            local ok, ResponseData = Pcall(__request, RequestData)
+            if not ok then
+                return cresume(t, nil, ResponseData)   -- propagate error to caller
+            end
 
-if not debug.info(2, "f") then
-    pconsole("You are running an outdated version, please use the loadstring at https://github.com/NotDSF/HttpSpy\n");
-end;
+            -- log-only fast path
+            if not S.Enabled then
+                return cresume(t, S.Hooked[RequestData.Url] and S.Hooked[RequestData.Url](ResponseData) or ResponseData)
+            end
 
--- Hooks are live now; mark installed so future runs take the fast reuse path.
-store.installed = true;
+            if not S.Options.ShowResponse then
+                printf("%s.request(%s)\n\n", libtype, Serializer.Serialize(RequestData))
+                return cresume(t, S.Hooked[RequestData.Url] and S.Hooked[RequestData.Url](ResponseData) or ResponseData)
+            end
 
-if not options.API then return end;
+            -- copy response for display so AutoDecode doesn't mutate the real body
+            local BackupData = {}
+            for i, v in Pairs(ResponseData) do
+                BackupData[i] = v
+            end
 
-local API = {};
-API.OnRequest = OnRequest.Event;
+            if BackupData.Headers and BackupData.Headers["Content-Type"]
+                and match(BackupData.Headers["Content-Type"], "application/json")
+                and S.Options.AutoDecode then
+                local okd, res = Pcall(game.HttpService.JSONDecode, game.HttpService, BackupData.Body)
+                if okd then BackupData.Body = res end
+            end
 
-function API:HookSynRequest(url, hook) 
-    hooked[url] = hook;
-end;
+            printf("%s.request(%s)\n\nResponse Data: %s\n\n",
+                libtype, Serializer.Serialize(RequestData), Serializer.Serialize(BackupData))
 
-function API:ProxyHost(host, proxy) 
-    proxied[host] = proxy;
-end;
+            cresume(t, S.Hooked[RequestData.Url] and S.Hooked[RequestData.Url](ResponseData) or ResponseData)
+        end)()
 
-function API:RemoveProxy(host) 
-    if not proxied[host] then
-        error("host isn't proxied", 0);
-    end;
-    proxied[host] = nil;
-end;
+        local result, err = cyield()
+        if err then Error(err, 0) end
+        return result
+    end))
+    State.Originals.request = __request
 
-function API:UnHookSynRequest(url) 
-    if not hooked[url] then
-        error("url isn't hooked", 0);
-    end;
-    hooked[url] = nil;
+    if request then
+        replaceclosure(request, reqfunc)
+    end
+
+    -----------------------------------------------------------------------
+    -- 1g. game.HttpGet / HttpPost / GetObjects hooks (install once)
+    -----------------------------------------------------------------------
+    State.Originals.methods = {}
+    for method, on in Pairs(methods) do
+        if on then
+            local b
+            b = hookfunction(game[method], newcclosure(function(self, ...)
+                local S = GENV._G[KEY]
+                if S.Enabled then
+                    printf("game.%s(game, %s)\n\n", method, Serializer.FormatArguments(...))
+                end
+                return b(self, ...)
+            end))
+            State.Originals.methods[method] = b
+        end
+    end
+
+    -----------------------------------------------------------------------
+    -- 1h. Public API (built once, stored forever)
+    -----------------------------------------------------------------------
+    local API = {}
+    API.OnRequest = OnRequest.Event
+
+    -- spoofing
+    function API:AddSpoof(pattern, modifier)   -- modifier: table | function(req)
+        State.Spoofs[pattern] = modifier
+    end
+    function API:RemoveSpoof(pattern)
+        State.Spoofs[pattern] = nil
+    end
+    function API:ClearSpoofs()
+        State.Spoofs = {}
+    end
+    function API:GetSpoofs()
+        return State.Spoofs
+    end
+
+    -- response hooking / proxy / blocking (from HttpSpy)
+    function API:HookSynRequest(url, hook)  State.Hooked[url] = hook end
+    function API:UnHookSynRequest(url)
+        if not State.Hooked[url] then Error("url isn't hooked", 0) end
+        State.Hooked[url] = nil
+    end
+    function API:ProxyHost(host, proxy)     State.Proxied[host] = proxy end
+    function API:RemoveProxy(host)
+        if not State.Proxied[host] then Error("host isn't proxied", 0) end
+        State.Proxied[host] = nil
+    end
+    function API:BlockUrl(url)      State.Blocked[url] = true  end
+    function API:WhitelistUrl(url)  State.Blocked[url] = false end
+
+    -- logging control
+    function API:Enable()  State.Enabled = true  end
+    function API:Disable() State.Enabled = false end
+    function API:SetOption(name, value) State.Options[name] = value end
+
+    State.API = API
+    GENV._G.HttpSpy = API   -- convenience alias
+
+    pconsole(format("[HttpSpy+Spoofer %s] Engine installed. Hooks are live.\n", State.Version))
 end
 
-function API:BlockUrl(url) 
-    blocked[url] = true;
-end;
+--=============================================================================
+-- 2. LIVE CONFIG  (runs EVERY execution -- refreshes options + spoof rules)
+--    Edit below and re-execute to update behaviour without rejoining.
+--=============================================================================
+local State = GENV._G[KEY]
 
-function API:WhitelistUrl(url) 
-    blocked[url] = false;
-end;
+-- Merge any options passed as the first vararg on this run
+if type(passedOptions) == "table" then
+    for k, v in pairs(passedOptions) do
+        State.Options[k] = v
+    end
+    if State.Serializer and passedOptions.Highlighting ~= nil then
+        State.Serializer.UpdateConfig({ highlighting = passedOptions.Highlighting })
+    end
+end
 
--- Register a spoof rule.
---   url      : Lua pattern matched against the request URL with string.find
---   response : table (static response) or function(requestData) -> response table
-function API:Spoof(url, response) 
-    spoofs[url] = response;
-end;
+-- Reset spoof rules so edits/removals take effect cleanly on re-run
+State.Spoofs = {}
 
-function API:UnSpoof(url) 
-    if not spoofs[url] then
-        error("url isn't spoofed", 0);
-    end;
-    spoofs[url] = nil;
-end;
+-----------------------------------------------------------------------------
+-- YOUR ACTIVE SPOOF RULES
+-- key   = substring to match in the request URL (plain match, not a pattern)
+-- value = either a static response table, or function(req) -> response table
+-----------------------------------------------------------------------------
 
-function API:ClearSpoofs() 
-    table.clear(spoofs);
-end;
+-- Static example: any URL containing "example" returns this table instantly
+State.Spoofs["example"] = {
+    StatusCode = 200,
+    Success    = true,
+    Body       = "data",
+}
 
-store.API = API;
-return API;
+-- Dynamic example: inspect the outgoing request and build a response
+-- State.Spoofs["api/getcoins"] = function(req)
+--     return {
+--         StatusCode = 200,
+--         Success    = true,
+--         Body       = game:GetService("HttpService"):JSONEncode({ coins = 999999 }),
+--     }
+-- end
+
+-----------------------------------------------------------------------------
+
+State.Printf("[HttpSpy+Spoofer] Config refreshed. Active spoof rules: ")
+do
+    local n = 0
+    for _ in pairs(State.Spoofs) do n = n + 1 end
+    State.Printf("%d\n\n", n)
+end
+
+return State.API
