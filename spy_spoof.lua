@@ -54,7 +54,7 @@ if not GENV._G[KEY] then
 
     -----------------------------------------------------------------------
     -- 1b. Clone everything the hooks touch so our own calls stay un-hooked
-    -----------------------------------------------------------------------
+    ------------------------------------------------------------------------
     local clonef      = clonefunction
     local pconsole    = clonef(rconsoleprint)
     local format      = clonef(string.format)
