@@ -149,6 +149,7 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
     local methods = {
         HttpGet = not syn, HttpGetAsync = not syn, GetObjects = true,
         HttpPost = not syn, HttpPostAsync = not syn,
+        GetAsync = true, PostAsync = true, RequestAsync = true -- Added HttpService methods
     }
 
     -----------------------------------------------------------------------
@@ -167,8 +168,15 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
     -----------------------------------------------------------------------
     -- request hook: SPOOF + BLOCK + PROXY + LOG (reads State upvalue)
     -----------------------------------------------------------------------
+    -- Gather all possible request aliases so no global request function is
+    -- left unhooked (Luarmor & friends probe several of these).
+    local request_aliases = {
+        request, http_request,
+        (http and http.request), (syn and syn.request), (fluxus and fluxus.request)
+    }
+
     local __request
-    __request = hookfunction(reqfunc, newcclosure(function(req)
+    local request_closure = newcclosure(function(req)
         if Type(req) ~= "table" or Type(req.Url) ~= "string" then
             return __request(req)
         end
@@ -243,12 +251,25 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
         local result, err = cyield()
         if err then Error(err, 0) end
         return result
-    end))
-    State.Originals.request = __request
+    end)
 
-    if request and replaceclosure then
-        pcall(replaceclosure, request, reqfunc)
+    -- Apply the hook to every unique alias. The first original returned by
+    -- hookfunction seeds __request, which the closure's trampoline calls.
+    State.Originals.requests = {}
+    for i, func in Pairs(request_aliases) do
+        if Type(func) == "function" then
+            local orig = hookfunction(func, request_closure)
+            if not __request then __request = orig end -- required for the inner trampoline
+            State.Originals.requests[tostring(i)] = orig
+        end
     end
+
+    -- Fall back to hooking the resolved reqfunc if none of the named aliases
+    -- were live, so the trampoline still has a valid original to call.
+    if not __request then
+        __request = hookfunction(reqfunc, request_closure)
+    end
+    State.Originals.request = __request
 
     -----------------------------------------------------------------------
     -- game.HttpGet / HttpPost / GetObjects hooks
@@ -269,6 +290,28 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
                 return b(self, ...)
             end))
             State.Originals.methods[method] = b
+        end
+    end
+
+    -----------------------------------------------------------------------
+    -- HttpService direct hooks
+    -- Catches GetAsync/PostAsync/RequestAsync calls made directly on the
+    -- HttpService object, which can bypass the __namecall fast path.
+    -----------------------------------------------------------------------
+    local HttpService = game:GetService("HttpService")
+    if HttpService then
+        for _, method in Pairs({ "GetAsync", "PostAsync", "RequestAsync" }) do
+            local ok, fn = pcall(function() return HttpService[method] end)
+            if ok and Type(fn) == "function" then
+                local b
+                b = hookfunction(fn, newcclosure(function(self, ...)
+                    if State.Enabled then
+                        printf("HttpService.%s(HttpService, %s)\n\n", method, Serializer.FormatArguments(...))
+                    end
+                    return b(self, ...)
+                end))
+                State.Originals.methods["HttpService_"..method] = b
+            end
         end
     end
 
