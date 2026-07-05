@@ -33,7 +33,7 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
 
     -- Build everything against this LOCAL table; publish at the very end.
     local State = {
-        Version   = "2.1.2",
+        Version   = "2.1.3",
         Enabled   = true,
         Options   = { AutoDecode = true, Highlighting = true, SaveLogs = true, ShowResponse = true, API = true },
         Spoofs    = {},
@@ -44,9 +44,23 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
     }
 
     -----------------------------------------------------------------------
-    -- Clones with fallbacks for functions not every executor exposes
+    -- clonefunction hardening
+    -- Grab an un-hookable clone of clonefunction ITSELF and use that to clone
+    -- every other function. If clonefunction were hooked, our clean references
+    -- could be compromised; cloning the cloner first closes that gap. If the
+    -- executor doesn't expose clonefunction, refuse to install rather than run
+    -- unprotected (graceful bail -- we do NOT crash the game).
     -----------------------------------------------------------------------
-    local clonef = clonefunction or function(f) return f end
+    local rawclone = clonefunction
+    if not rawclone then
+        warn("[HttpSpy+Spoofer] executor missing clonefunction; refusing to install unprotected")
+        return
+    end
+    local clonef = rawclone(clonefunction)
+    if not clonef then
+        warn("[HttpSpy+Spoofer] failed to clone clonefunction; aborting")
+        return
+    end
 
     -- required core (if these are missing the tool genuinely can't run)
     assert(hookfunction,       "executor missing hookfunction")
