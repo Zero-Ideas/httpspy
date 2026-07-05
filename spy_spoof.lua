@@ -168,8 +168,7 @@ if not (GENV._G[KEY] and GENV._G[KEY].API) then
     -----------------------------------------------------------------------
     -- request hook: SPOOF + BLOCK + PROXY + LOG (reads State upvalue)
     -----------------------------------------------------------------------
-    -- Gather all possible request aliases so no global request function is
-    -- left unhooked (Luarmor & friends probe several of these).
+
     local request_aliases = {
         request, http_request,
         (http and http.request), (syn and syn.request), (fluxus and fluxus.request)
